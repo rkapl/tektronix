@@ -1,0 +1,6 @@
+*.pyc
+.idea
+/dist/
+/*.egg-info
+/refdoc
+/test-out

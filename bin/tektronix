@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+import usbtmc
+import sys
+import argparse
+import os
+import os.path
+import json
+import io
+import csv
+import struct
+
+try:
+    import tektronix
+except ImportError:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.exists(os.path.join(script_dir, 'src.marker')):
+        sys.path.append(os.path.join(script_dir, '..'))
+
+from tektronix import wfmpre, curve
+
+def err(str):
+    sys.stderr.write(str)
+    exit(1)
+
+class FormatException(Exception):
+    pass
+
+def store_file(dir, file, mode, data):
+    with open(os.path.join(dir, file), mode) as f:
+        f.write(data)
+
+# parse and validate header
+def split_header(data):
+    data = io.BytesIO(data)
+    c = data.read1(1)
+    if c != b'#':
+        raise FormatException('First character of curve data should be #')
+
+    try:
+        c = int(data.read1(1).decode('ascii'))
+        data_len = int(data.read1(c).decode('ascii'))
+    except ValueError:
+        raise FormatException('Invalid header format')
+
+    data = data.read1()
+    if len(data) == 0:
+        raise FormatException('Missing data')
+    if data[len(data) - 1] != 0x0A:
+        raise FormatException('Missing terminator')
+    data = data[:len(data) - 1]
+
+    if len(data) != data_len:
+        raise FormatException('Header does not match data, {} != {}'.format(len(data), data_len))
+    return data
+
+def read_point(data):
+    point = data.read(2)
+    return struct.unpack('>h', point)[0]
+
+def do_acquire():
+    devices = usbtmc.list_devices()
+    if len(devices) == 0:
+        err('No usbtmc device found\n')
+        exit(1)
+
+    try:
+        channels = [int(c) for c in args.channels.split(',')]
+    except ValueError:
+        err('Invalid channel specification: {}\n'.format(args.channels))
+
+    instrument = usbtmc.Instrument(devices[0])
+    instrument.open()
+
+    identification = instrument.ask('*IDN?')
+    print(identification)
+    instrument.write('RS232:TRANsmit:TERMinator LF')
+    instrument.write('DATA:ENC RIBinary')
+    instrument.write('DATA:WID 2')
+
+    info = {
+        'channels': [],
+        'identification': identification,
+    }
+    data_columns = []
+    if args.comment:
+        info['comment'] = args.comment
+
+    dir = args.directory
+    try:
+        os.mkdir(dir)
+    except FileExistsError:
+        sys.stderr.write('Directory already exists, overwriting existing files\n')
+
+    for c in channels:
+        cinfo = {
+            'channel': c,
+        }
+        info['channels'].append(cinfo)
+        cinfo['wfmpre.py'] = instrument.ask('WFMPre?')
+
+        data = instrument.ask_raw('CURV?'.encode('ascii'))
+        if args.store_raw:
+            store_file(dir, 'channel-{}.bin'.format(c), 'wb', data)
+        data = split_header(data)
+        data_columns.append(data)
+
+    data_lengths = [len(c) for c in data_columns]
+    data = [io.BytesIO(c) for c in data_columns]
+    if len(set(data_lengths)) != 1:
+        raise FormatException('Incosistent length of waweforms: {}', data_lengths.join(', '))
+
+    data_length =  int(list(set(data_lengths))[0] / 2)
+
+    with open(os.path.join(dir, 'data.csv'), 'wt') as csv_file:
+        csv_writer = csv.writer(csv_file)
+        for l in range(data_length):
+            row = [read_point(c) for c in data]
+            csv_writer.writerow(row)
+
+    store_file(dir, 'info.json', 'wt', json.dumps(info, indent='  '))
+
+parser = argparse.ArgumentParser()
+subparsers = parser.add_subparsers()
+
+acquire = subparsers.add_parser('acquire', aliases=['ac'])
+acquire.add_argument('directory')
+acquire.add_argument('--channels', default='1')
+acquire.add_argument('--store-raw', action='store_true')
+acquire.add_argument('--comment')
+acquire.set_defaults(fn = do_acquire)
+
+args = parser.parse_args()
+if not 'fn' in args:
+    err('Select one of the commands, see -h for help\n')
+
+args.fn()
