@@ -1,1 +1,0 @@
-from tektronix import FormatException

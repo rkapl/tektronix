@@ -5,10 +5,8 @@ import argparse
 import os
 import os.path
 import json
-import io
 import csv
-import struct
-from tektronix import curve, wfmpre, FormatException
+import subprocess
 
 try:
     import tektronix
@@ -17,7 +15,7 @@ except ImportError:
     if os.path.exists(os.path.join(script_dir, 'src.marker')):
         sys.path.append(os.path.join(script_dir, '..'))
 
-from tektronix import wfmpre, curve
+from tektronix import wfparse, curve, FormatException
 
 def err(str):
     sys.stderr.write(str)
@@ -26,6 +24,17 @@ def err(str):
 def store_file(dir, file, mode, data):
     with open(os.path.join(dir, file), mode) as f:
         f.write(data)
+
+def str2bool(v):
+    if isinstance(v, bool):
+       return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 def do_acquire():
     devices = usbtmc.list_devices()
     if len(devices) == 0:
@@ -54,7 +63,6 @@ def do_acquire():
     if args.comment:
         info['comment'] = args.comment
 
-    dir = args.directory
     try:
         os.mkdir(dir)
     except FileExistsError:
@@ -65,7 +73,8 @@ def do_acquire():
             'channel': c,
         }
         info['channels'].append(cinfo)
-        cinfo['wfmpre.py'] = instrument.ask('WFMPre?')
+        instrument.write('DATA:SOU CH{}'.format(c))
+        cinfo['wfmpre'] = instrument.ask('WFMPre?')
 
         data = instrument.ask_raw('CURV?'.encode('ascii'))
         if args.store_raw:
@@ -80,23 +89,105 @@ def do_acquire():
     with open(os.path.join(dir, 'data.csv'), 'wt') as csv_file:
         csv_writer = csv.writer(csv_file)
         for i in range(data_length):
-            row = [c[i] for c in data]
+            row = [c[i] for c in data_columns]
             csv_writer.writerow(row)
 
     store_file(dir, 'info.json', 'wt', json.dumps(info, indent='  '))
 
+def do_load():
+    global info, channel_presets
+    with open(os.path.join(dir, 'info.json'), 'rt') as f:
+        info = json.loads(f.read())
+
+    channel_presets = []
+    for c in info['channels']:
+        channel_presets.append(wfparse.WfmPresets.parse(c   ['wfmpre']))
+
+def guess_unit(range):
+    if range < 0.5:
+        return ('m', 0.001)
+    if range < 0.0005:
+        return ('u', 0.000001)
+
+def do_gnuplot():
+    with open(os.path.join(dir, 'script.plot'), 'wt') as f:
+        default_preset = channel_presets[0]
+        x_unit, x_scale = guess_unit(default_preset.x_seconds_per_point * default_preset.number_of_points)
+
+        f.write('set term pdf\n')
+        f.write('set output "data.pdf"\n')
+        f.write('set datafile separator ","\n')
+        f.write('set ylabel "{}"\n'.format(default_preset.y_unit))
+        f.write('set xlabel "{}"\n'.format(x_unit + default_preset.x_unit))
+
+        # conversion from display coordinates to physical ones
+        # x = x_zero + x_seconds_per_point * x'
+        # y = (y' - y_off) * y_mult + y_zero
+
+        # we also need inverse for y, so
+        # (y - y_zero) / y_mult = y' - y_off
+        # y' = (y - y_zero) / y_mult + y_off
+
+        if args.scope_like:
+            f.write('set format y ""\n')
+            f.write('set yrange [-32768:32768]\n')
+            #f.write('set yticks []')
+            for p in channel_presets:
+                yd = (0 - p.y_zero) / p.y_mult + p.y_off
+                f.write('set arrow from graph 0, first {} to graph 0.05, first {}\n'.format(yd, yd))
+
+        for c, cinfo in enumerate(info['channels']):
+            p = channel_presets[c]
+            if c == 0:
+                f.write('plot "data.csv"')
+            else:
+                f.write(', ""')
+
+            if not args.scope_like:
+                y_off = p.y_off
+                y_mult = p.y_mult
+                y_zero = p.y_zero
+            else:
+                y_off = 0
+                y_mult = 1
+                y_zero = 0
+
+            f.write(' using (({} + $0 * {})/{}):((${} - {}) * {} + {}) with lines title "Ch {}"'.format(
+                p.x_zero, p.x_seconds_per_point, x_scale,
+                c + 1, y_off, y_mult, y_zero,
+                c + 1))
+        f.write('\n')
+
+    if args.render:
+        subprocess.run(['gnuplot', 'script.plot'], check=True, cwd=dir)
+
+def do_dump_presets():
+    for i, c in enumerate(channel_presets):
+        print("Channel {}".format(i + 1, c))
+        c.dump()
+
 parser = argparse.ArgumentParser()
-subparsers = parser.add_subparsers()
-
-acquire = subparsers.add_parser('acquire', aliases=['ac'])
-acquire.add_argument('directory')
-acquire.add_argument('--channels', default='1')
-acquire.add_argument('--store-raw', action='store_true')
-acquire.add_argument('--comment')
-acquire.set_defaults(fn = do_acquire)
-
+parser.add_argument('directory')
+parser.add_argument('--channels', default='1')
+parser.add_argument('--store-raw',  type=str2bool, default=True, metavar='BOOL')
+parser.add_argument('--comment')
+parser.add_argument('--acquire', '-a', type=str2bool, default=True, metavar='BOOL')
+parser.add_argument('--gnuplot', type=str2bool, default=True, metavar='BOOL')
+parser.add_argument('--render', type=str2bool, default=True, metavar='BOOL')
+parser.add_argument('--scope-like', type=str2bool, default=True, metavar='BOOL')
+parser.add_argument('--dump-presets', type=str2bool, default=True, metavar='BOOL')
 args = parser.parse_args()
-if not 'fn' in args:
-    err('Select one of the commands, see -h for help\n')
 
-args.fn()
+dir = args.directory
+
+if args.acquire:
+    do_acquire()
+
+# Always load, even just to test corectness of the aquisition
+do_load()
+
+if args.gnuplot:
+    do_gnuplot()
+
+if args.dump_presets:
+    do_dump_presets()
