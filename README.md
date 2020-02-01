@@ -18,7 +18,7 @@ Setup your scope, stop it, and acquire and plot the data by running:
 
      bin/tektronix --channels 1,2 test-data
 
-The samples from channels 1 and 2 will be saved to directory test data and
+The samples from channels 1 and 2 will be saved to directory `test-data` and
 plotted using gnuplot.
 
 By default, the produced gnuplot is similar to what your oscilloscope shows: it
